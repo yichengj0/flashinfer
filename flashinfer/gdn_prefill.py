@@ -274,7 +274,16 @@ def chunk_gated_delta_rule(
     _scale = scale if scale is not None and scale != 0.0 else 1.0 / math.sqrt(head_size)
 
     _cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
-    _is_sm100a = get_compute_capability(device)[0] == 10
+    _sm_major = get_compute_capability(device)[0]
+    if _sm_major not in (9, 10):
+        # The SM90 module below is SASS-only (code=sm_90a, no PTX) and faults
+        # at kernel launch on any other arch (#3170) — reject instead.
+        raise NotImplementedError(
+            f"GDN prefill is not supported on SM{_sm_major}x; only SM90 "
+            "(Hopper) and SM100/SM103 (Blackwell datacenter) are supported. "
+            "See https://github.com/flashinfer-ai/flashinfer/issues/3170."
+        )
+    _is_sm100a = _sm_major == 10
     if _is_sm100a:
         if _cuda_major < 13:
             raise NotImplementedError(
