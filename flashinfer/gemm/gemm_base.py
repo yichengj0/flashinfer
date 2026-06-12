@@ -3891,6 +3891,23 @@ def _expand_block_scale_tensor_shape(block_scale_tensor, batch_size):
     return (tuple(block_scale_shape), tuple(block_scale_stride))
 
 
+# TRT-LLM low-latency GEMM ships SM100-only SASS (no PTX fallback); other
+# archs (e.g. SM12x) must be rejected before kernel launch (#3170).
+@supported_compute_capability([100, 103])
+def _check_mm_fp8_trtllm_low_latency_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    alpha: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    out: Optional[torch.Tensor] = None,
+    backend: Literal["trtllm_low_latency"] = "trtllm_low_latency",
+) -> bool:
+    return True
+
+
+@backend_requirement(
+    {"trtllm_low_latency": _check_mm_fp8_trtllm_low_latency_requirement},
+)
 @flashinfer_api(trace=mm_fp8_trace)
 def mm_fp8(
     a: torch.Tensor,

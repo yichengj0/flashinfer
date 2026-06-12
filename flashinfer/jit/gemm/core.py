@@ -841,6 +841,10 @@ def gen_gemm_sm90_module() -> JitSpec:
 
 
 def gen_trtllm_low_latency_gemm_module() -> JitSpec:
+    # SM100-only SASS (no PTX): refuse other target archs early instead of
+    # emitting a binary that fails at kernel launch (#3170).
+    current_compilation_context.get_nvcc_flags_list(supported_major_versions=[10])
+
     include_path = f"{ArtifactPath.TRTLLM_GEN_GEMM}/include"
     header_name = "flashinferMetaInfo"
 
