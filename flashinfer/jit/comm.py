@@ -188,8 +188,10 @@ def gen_mixed_comm_module() -> JitSpec:
 
 
 def gen_trtllm_comm_module() -> JitSpec:
+    # 12 = SM12x (RTX 50xx / DGX Spark): compiles cleanly for sm_121a (verified
+    # on GB10); multi-GPU numerical validation still pending (#3170).
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[9, 10]
+        supported_major_versions=[9, 10, 12]
     )
     return gen_jit_spec(
         "trtllm_comm",
