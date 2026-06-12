@@ -6029,11 +6029,17 @@ def _heuristic_func_mm_fp4(
     # Get compute capability to distinguish between SM100 (10.0) and SM103 (10.3)
     major, minor = get_compute_capability(a.device)
     is_sm103 = major == 10 and minor == 3
+    is_sm12x = major == 12
     is_sm120 = major == 12 and minor == 0
 
-    # SM120 + CUDA 13: prefer b12x (warp-level MMA, underfill tile selection)
-    if is_sm120 and use_nvfp4 and cuda_major >= 13:
-        return [c for c in ("b12x", "cutlass", "cudnn") if c in suitable_backends]
+    # SM12x + CUDA 13 + NVFP4: include b12x so the autotuner can pick it.
+    # Default order: b12x first on SM120 (its design target); cutlass first on
+    # SM121, measured faster at decode-shaped small M on GB10 (#3170).
+    if is_sm12x and use_nvfp4 and cuda_major >= 13:
+        order = (
+            ("b12x", "cutlass", "cudnn") if is_sm120 else ("cutlass", "b12x", "cudnn")
+        )
+        return [c for c in order if c in suitable_backends]
 
     # If cuda version is 13 or greater and cudnn version is 9.15 or greater:
     # On SM103 (B300), cutlass is more performant than cudnn.
