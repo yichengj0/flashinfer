@@ -145,6 +145,12 @@ output_column_dict = {
         "update_state",
         "use_qk_l2norm",
     ],
+    "msa": [
+        "topk",
+        "max_k_tiles",
+        "total_q",
+        "total_kv",
+    ],
     "general": [
         "batch_size",
         "hidden_size",
@@ -183,6 +189,7 @@ full_output_columns = (
     + output_column_dict["rope"]
     + output_column_dict["mamba"]
     + output_column_dict["gdn"]
+    + output_column_dict["msa"]
     + output_column_dict["general"]
 )
 
@@ -276,6 +283,14 @@ benchmark_apis = {
         "gated_delta_rule_decode",
         "gated_delta_rule_mtp",
         "chunk_gated_delta_rule",
+    ],
+    "sparse_attention": [
+        "MSAProxyScore",
+        "MSATopkSelect",
+        "MSABuildCsr",
+        "MSASparseAttentionKvMajor",
+        "MSASparseDecode",
+        "MSAPipeline",
     ],
 }
 
