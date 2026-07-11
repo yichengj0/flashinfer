@@ -1732,23 +1732,17 @@ class SparseCombineSm12x:
 
         if count == self._topk:
             # All slots active (the common case): no garbage partials, so the
-            # NaN clamp is unnecessary. Loading every slot into registers before
-            # the weighted sum keeps all loads in flight at once — the sub-wave
-            # grid has too few warps to hide latency any other way.
+            # NaN clamp is unnecessary.
             for i in cutlass.range_constexpr(self._channels_per_thread):
                 c = tidx + i * self._num_threads
-                e_frag = cute.make_rmem_tensor(
-                    cute.make_layout(self._topk), cutlass.Float32
-                )
+                acc = cutlass.Float32(0.0)
                 for s in cutlass.range_constexpr(self._topk):
                     e = mO_partial[s, q, h, c]
                     if cutlass.const_expr(self._partial_is_fp8):
-                        e_frag[s] = e.to(cutlass.Float16).to(cutlass.Float32)
+                        ef = e.to(cutlass.Float16).to(cutlass.Float32)
                     else:
-                        e_frag[s] = e.to(cutlass.Float32)
-                acc = cutlass.Float32(0.0)
-                for s in cutlass.range_constexpr(self._topk):
-                    acc += w_frag[s] * e_frag[s]
+                        ef = e.to(cutlass.Float32)
+                    acc += w_frag[s] * ef
                 mOut[q, h, c] = (acc * inv * out_scale).to(mOut.element_type)
         else:
             # Branch-free: all topk slots load unconditionally (they pipeline);
