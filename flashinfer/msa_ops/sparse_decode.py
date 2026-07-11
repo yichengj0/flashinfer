@@ -384,6 +384,10 @@ def msa_sparse_decode_attention(
     else:
         num_chunks = _decode_num_chunks(total_q * num_kv_heads, topk, dev, kv_nvfp4)
         fused = num_chunks == 1
+    # Per-block split (low batch) on bf16/fp16 takes the warp-per-sub-block
+    # schedule: no cross-warp barriers in the compute, which the looped kernel
+    # pays for when a single CTA is resident per SM.
+    block_split = not fused and not kv_fp8 and not kv_nvfp4 and num_chunks == topk
 
     if fused:
         # The split-path partial buffers collapse to dummies.
@@ -432,6 +436,7 @@ def msa_sparse_decode_attention(
         str(partial_dtype),
         fused,
         qoff_default,
+        block_split,
     )
     compiled = _compile_cache.get(key)
     if compiled is None:
@@ -462,6 +467,7 @@ def msa_sparse_decode_attention(
             q_fp8=q_fp8,
             fused=fused,
             qoff_default=qoff_default,
+            block_split=block_split,
         )
         compiled = cute.compile(
             kernel_obj,

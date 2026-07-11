@@ -49,6 +49,7 @@ class SparseDecodeForwardSm12x:
         q_fp8: bool = False,
         fused: bool = False,
         qoff_default: bool = False,
+        block_split: bool = False,
     ):
         if head_dim != 128 or blk_kv != 128:
             raise ValueError("only head_dim=blk_kv=128 supported")
@@ -63,6 +64,18 @@ class SparseDecodeForwardSm12x:
         self._sub_block = 32 if self._pipeline else 64
         self._n_sub = blk_kv // self._sub_block
         self._m_tile = 16
+        # block_split: one KV block per CTA (the low-batch adaptive split). Each
+        # warp owns one 32-token sub-block end to end — its own QK, softmax and
+        # PV with no cross-warp barrier — and the four partial softmax states are
+        # LSE-merged through smem at the end. The looped single-compute-warp
+        # schedule below serializes on CTA barriers when only one CTA is resident
+        # per SM, which is exactly the low-batch regime this variant serves.
+        self._block_split = block_split
+        if block_split:
+            if fused or kv_fp8 or kv_nvfp4:
+                raise ValueError("block_split requires the bf16/fp16 split path")
+            if num_threads != 128 or blk_kv // self._sub_block != 4:
+                raise ValueError("block_split requires 4 warps of 32-token sub-blocks")
         self._group_size = group_size
         self._topk = topk
         self._num_threads = num_threads
@@ -143,6 +156,25 @@ class SparseDecodeForwardSm12x:
                 seqlen_q,
             ).launch(
                 grid=(total_q, 1, num_kv_heads),
+                block=[self._num_threads, 1, 1],
+                stream=stream,
+            )
+        elif cutlass.const_expr(self._block_split):
+            self.kernel_block_split(
+                mQ,
+                mK,
+                mV,
+                mPageTable,
+                mQ2K,
+                mOp,
+                mLse,
+                mSplitCounts,
+                mCuK,
+                mQOffset,
+                softmax_scale_log2,
+                seqlen_q,
+            ).launch(
+                grid=(total_q, num_chunks, num_kv_heads),
                 block=[self._num_threads, 1, 1],
                 stream=stream,
             )
@@ -827,6 +859,369 @@ class SparseDecodeForwardSm12x:
                         )
 
     @cute.kernel
+    def kernel_block_split(
+        self,
+        mQ: cute.Tensor,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
+        mPageTable: cute.Tensor,
+        mQ2K: cute.Tensor,
+        mOp: cute.Tensor,
+        mLse: cute.Tensor,
+        mSplitCounts: cute.Tensor,
+        mCuK: cute.Tensor,
+        mQOffset: cute.Tensor,
+        softmax_scale_log2: cutlass.Float32,
+        seqlen_q: cutlass.Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        qi, chunk_idx, kv_head = cute.arch.block_idx()
+        warp_id = tidx // 32
+        lane = tidx % 32
+
+        G = self._group_size
+        n_warps = self._num_threads // 32
+
+        cnt = cutlass.Int32(0)
+        in_prefix = cutlass.Boolean(True)
+        for t in cutlass.range_constexpr(self._topk):
+            if in_prefix and mQ2K[kv_head, qi, t] >= 0:
+                cnt = cnt + 1
+            else:
+                in_prefix = cutlass.Boolean(False)
+
+        # One block per chunk: the combine reduces over the active blocks.
+        if chunk_idx == 0:
+            if tidx == 0:
+                mSplitCounts[qi, kv_head] = cnt
+
+        if chunk_idx < cnt:
+            batch_idx = qi // seqlen_q
+            tok_in_req = qi - batch_idx * seqlen_q
+            k_start = mCuK[batch_idx]
+            seqlen_k = mCuK[batch_idx + 1] - k_start
+
+            sQ_layout = cute.make_layout(
+                (self._m_tile, self._head_dim), stride=(self._pad_stride, 1)
+            )
+            sKV_all_layout = cute.make_layout(
+                (n_warps, self._sub_block, self._head_dim),
+                stride=(self._sub_block * self._pad_stride, self._pad_stride, 1),
+            )
+            kv_elems = n_warps * self._sub_block * self._pad_stride
+
+            @cute.struct
+            class SharedStorage:
+                sK: cute.struct.Align[cute.struct.MemRange[self._dtype, kv_elems], 1024]
+                sV: cute.struct.Align[cute.struct.MemRange[self._dtype, kv_elems], 1024]
+                sQ: cute.struct.Align[
+                    cute.struct.MemRange[self._dtype, self._m_tile * self._pad_stride],
+                    1024,
+                ]
+                sMax: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Float32, 4 * 16], 16
+                ]
+                sSum: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Float32, 4 * 16], 16
+                ]
+
+            smem = cutlass.utils.SmemAllocator()
+            storage = smem.allocate(SharedStorage)
+            sK_all = storage.sK.get_tensor(sKV_all_layout)
+            sV_all = storage.sV.get_tensor(sKV_all_layout)
+            sQ = storage.sQ.get_tensor(sQ_layout)
+            sMax = storage.sMax.get_tensor(cute.make_layout((n_warps, self._m_tile)))
+            sSum = storage.sSum.get_tensor(cute.make_layout((n_warps, self._m_tile)))
+            # The merged accumulators alias the (fully consumed) K staging area:
+            # n_warps x m_tile x head_dim f32 fits in its bf16 footprint.
+            sK_flat = storage.sK.get_tensor(cute.make_layout(kv_elems))
+            sAcc_f32 = cute.recast_tensor(sK_flat, cutlass.Float32)
+            sAcc = cute.make_tensor(
+                sAcc_f32.iterator,
+                cute.make_layout(
+                    (n_warps, self._m_tile, self._head_dim),
+                    stride=(self._m_tile * self._head_dim, self._head_dim, 1),
+                ),
+            )
+
+            sK = sK_all[warp_id, None, None]
+            sV = sV_all[warp_id, None, None]
+            sVt = cute.composition(
+                sV,
+                cute.make_layout(
+                    (self._head_dim, self._sub_block), stride=(self._sub_block, 1)
+                ),
+            )
+
+            chunks_per_row = self._head_dim // 8
+
+            tiled_mma = cute.make_tiled_mma(
+                warp.MmaF16BF16Op(self._dtype, cutlass.Float32, (16, 8, 16)),
+                (1, 1, 1),
+                permutation_mnk=(16, 16, 16),
+            )
+            thr_mma = tiled_mma.get_slice(lane)
+            tSrQ = thr_mma.make_fragment_A(thr_mma.partition_A(sQ))
+            tSrK = thr_mma.make_fragment_B(thr_mma.partition_B(sK))
+            tOrVt = thr_mma.make_fragment_B(thr_mma.partition_B(sVt))
+            acc_S = cute.make_rmem_tensor(
+                thr_mma.partition_shape_C((self._m_tile, self._sub_block)),
+                cutlass.Float32,
+            )
+            acc_O = cute.make_rmem_tensor(
+                thr_mma.partition_shape_C((self._m_tile, self._head_dim)),
+                cutlass.Float32,
+            )
+            acc_O.fill(0.0)
+
+            smem_copy_atom_QK = cute.make_copy_atom(
+                warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), self._dtype
+            )
+            smem_copy_atom_V = cute.make_copy_atom(
+                warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4), self._dtype
+            )
+            smem_tiled_copy_Q = cute.make_tiled_copy_A(smem_copy_atom_QK, tiled_mma)
+            smem_tiled_copy_K = cute.make_tiled_copy_B(smem_copy_atom_QK, tiled_mma)
+            smem_tiled_copy_V = cute.make_tiled_copy_B(smem_copy_atom_V, tiled_mma)
+            smem_thr_copy_Q = smem_tiled_copy_Q.get_slice(lane)
+            smem_thr_copy_K = smem_tiled_copy_K.get_slice(lane)
+            smem_thr_copy_V = smem_tiled_copy_V.get_slice(lane)
+            tSsQ = smem_thr_copy_Q.partition_S(sQ)
+            tSrQ_copy_view = smem_thr_copy_Q.retile(tSrQ)
+            tSsK = smem_thr_copy_K.partition_S(sK)
+            tSrK_copy_view = smem_thr_copy_K.retile(tSrK)
+            tOsVt = smem_thr_copy_V.partition_S(sVt)
+            tOrVt_copy_view = smem_thr_copy_V.retile(tOrVt)
+
+            cS = cute.make_identity_tensor((self._m_tile, self._sub_block))
+            tScS_mn = self._make_acc_tensor_mn_view(thr_mma.partition_C(cS))
+            cO = cute.make_identity_tensor((self._m_tile, self._head_dim))
+            tScO_mn = self._make_acc_tensor_mn_view(thr_mma.partition_C(cO))
+            acc_S_mn = self._make_acc_tensor_mn_view(acc_S)
+            acc_O_mn = self._make_acc_tensor_mn_view(acc_O)
+            n_rows = cute.size(acc_O_mn.shape[0])
+
+            row_max = cute.make_rmem_tensor((n_rows,), cutlass.Float32)
+            row_sum = cute.make_rmem_tensor((n_rows,), cutlass.Float32)
+
+            if cutlass.const_expr(self._is_causal):
+                if cutlass.const_expr(self._qoff_default):
+                    q_pos_limit = tok_in_req + (seqlen_k - seqlen_q) + 1
+                else:
+                    q_pos_limit = tok_in_req + mQOffset[batch_idx] + 1
+                col_limit = cutlass.min(q_pos_limit, seqlen_k)
+            else:
+                col_limit = seqlen_k
+
+            kv_block = mQ2K[kv_head, qi, chunk_idx]
+            if cutlass.const_expr(self._paged):
+                page = mPageTable[batch_idx, kv_block]
+                mK_blk = mK[page, kv_head, None, None]
+                mV_blk = mV[page, kv_head, None, None]
+            else:
+                mK_blk = cute.domain_offset(
+                    (k_start + kv_block * self._blk_kv, 0),
+                    mK[None, kv_head, None],
+                )
+                mV_blk = cute.domain_offset(
+                    (k_start + kv_block * self._blk_kv, 0),
+                    mV[None, kv_head, None],
+                )
+            base = kv_block * self._blk_kv + warp_id * self._sub_block
+
+            # Warp-local K/V staging via cp.async: every lane's chunks are in
+            # flight at once, so the whole sub-block costs ~one memory round
+            # trip instead of serialized register round-trips.
+            cpasync_atom = cute.make_copy_atom(
+                cute.nvgpu.cpasync.CopyG2SOp(), self._dtype, num_bits_per_copy=128
+            )
+            kvfrag = cute.make_rmem_tensor(cute.make_layout(8), self._dtype)
+            warp_chunks = self._sub_block * chunks_per_row
+            for kv_it in cutlass.range_constexpr(cute.ceil_div(warp_chunks, 32)):
+                kv_chunk = lane + kv_it * 32
+                if kv_chunk < warp_chunks:
+                    kv_m = kv_chunk // chunks_per_row
+                    kv_c8 = kv_chunk % chunks_per_row
+                    sK_chunk = cute.local_tile(sK[kv_m, None], (8,), (kv_c8,))
+                    sV_chunk = cute.local_tile(sV[kv_m, None], (8,), (kv_c8,))
+                    src_row = warp_id * self._sub_block + kv_m
+                    if (base + kv_m) < seqlen_k:
+                        gK_chunk = cute.local_tile(
+                            mK_blk[src_row, None], (8,), (kv_c8,)
+                        )
+                        gV_chunk = cute.local_tile(
+                            mV_blk[src_row, None], (8,), (kv_c8,)
+                        )
+                        cute.copy(cpasync_atom, gK_chunk, sK_chunk)
+                        cute.copy(cpasync_atom, gV_chunk, sV_chunk)
+                    else:
+                        kvfrag.fill(0)
+                        cute.autovec_copy(kvfrag, sK_chunk)
+                        cute.autovec_copy(kvfrag, sV_chunk)
+            cute.arch.cp_async_commit_group()
+
+            # Q staged by all threads (overlaps the in-flight K/V copies); every
+            # warp reads all of it.
+            q_chunks = self._m_tile * chunks_per_row
+            qfrag = cute.make_rmem_tensor(cute.make_layout(8), self._dtype)
+            for q_it in cutlass.range_constexpr(
+                cute.ceil_div(q_chunks, self._num_threads)
+            ):
+                q_chunk = tidx + q_it * self._num_threads
+                if q_chunk < q_chunks:
+                    q_m = q_chunk // chunks_per_row
+                    q_c8 = q_chunk % chunks_per_row
+                    s_chunk = cute.local_tile(sQ[q_m, None], (8,), (q_c8,))
+                    if q_m < G:
+                        g_row = mQ[qi, kv_head * G + q_m, None]
+                        g_chunk = cute.local_tile(g_row, (8,), (q_c8,))
+                        if cutlass.const_expr(self._q_fp8):
+                            qfrag.store(
+                                g_chunk.load()
+                                .to(cutlass.Float16)
+                                .to(cutlass.Float32)
+                                .to(self._dtype)
+                            )
+                            cute.autovec_copy(qfrag, s_chunk)
+                        else:
+                            cute.autovec_copy(g_chunk, s_chunk)
+                    else:
+                        qfrag.fill(0)
+                        cute.autovec_copy(qfrag, s_chunk)
+
+            cute.arch.cp_async_wait_group(0)
+            self.cta_sync_barrier.arrive_and_wait()
+            for k in cutlass.range_constexpr(cute.size(tSsQ.shape[2])):
+                cute.copy(
+                    smem_tiled_copy_Q,
+                    tSsQ[None, None, k],
+                    tSrQ_copy_view[None, None, k],
+                )
+            cute.arch.sync_warp()
+
+            acc_S.fill(0.0)
+            for k in cutlass.range_constexpr(cute.size(tSsK.shape[2])):
+                cute.copy(
+                    smem_tiled_copy_K,
+                    tSsK[None, None, k],
+                    tSrK_copy_view[None, None, k],
+                )
+            for k in cutlass.range_constexpr(cute.size(tSsK.shape[2])):
+                cute.gemm(
+                    tiled_mma,
+                    acc_S,
+                    tSrQ[None, None, k],
+                    tSrK[None, None, k],
+                    acc_S,
+                )
+
+            # Single tile per warp: plain (not online) softmax; thread-partial row
+            # sums are quad-reduced at the merge write.
+            for r in cutlass.range_constexpr(n_rows):
+                for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
+                    k_pos = base + tScS_mn[0, c][1]
+                    if cute.elem_less(col_limit, k_pos + 1):
+                        acc_S_mn[r, c] = -cutlass.Float32.inf
+                acc_S_row = acc_S_mn[r, None].load()
+                rmax = acc_S_row.reduce(cute.ReductionOp.MAX, -cutlass.Float32.inf, 0)
+                rmax = self._threadquad_reduce_max(rmax)
+                rmax_safe = 0.0 if rmax == -cutlass.Float32.inf else rmax
+                p_row = cute.math.exp2(
+                    acc_S_row * softmax_scale_log2 - rmax_safe * softmax_scale_log2,
+                    fastmath=True,
+                )
+                row_sum[r] = p_row.reduce(cute.ReductionOp.ADD, cutlass.Float32.zero, 0)
+                row_max[r] = rmax
+                acc_S_mn[r, None] = p_row
+
+            rP = cute.make_fragment_like(acc_S, self._dtype)
+            rP.store(acc_S.load().to(self._dtype))
+            rP_div = cute.logical_divide(rP.layout, (None, None, 2))
+            tOrS = cute.make_tensor(
+                rP.iterator,
+                cute.make_layout(
+                    (
+                        (rP_div.shape[0], rP_div.shape[2][0]),
+                        rP_div.shape[1],
+                        rP_div.shape[2][1],
+                    ),
+                    stride=(
+                        (rP_div.stride[0], rP_div.stride[2][0]),
+                        rP_div.stride[1],
+                        rP_div.stride[2][1],
+                    ),
+                ),
+            )
+            for k in cutlass.range_constexpr(cute.size(tOsVt.shape[2])):
+                cute.copy(
+                    smem_tiled_copy_V,
+                    tOsVt[None, None, k],
+                    tOrVt_copy_view[None, None, k],
+                )
+            for k in cutlass.range_constexpr(cute.size(tOrS.shape[2])):
+                cute.gemm(
+                    tiled_mma,
+                    acc_O,
+                    tOrS[None, None, k],
+                    tOrVt[None, None, k],
+                    acc_O,
+                )
+
+            # All warps must be done reading K before its smem is reused as the
+            # f32 accumulator exchange.
+            self.cta_sync_barrier.arrive_and_wait()
+            for r in cutlass.range_constexpr(n_rows):
+                g = tScO_mn[r, 0][0]
+                rs = self._threadquad_reduce_sum(row_sum[r])
+                sMax[warp_id, g] = row_max[r]
+                sSum[warp_id, g] = rs
+                for c in cutlass.range_constexpr(cute.size(tScO_mn.shape[1])):
+                    sAcc[warp_id, g, tScO_mn[0, c][1]] = acc_O_mn[r, c]
+            self.cta_sync_barrier.arrive_and_wait()
+
+            cute.arch.griddepcontrol_launch_dependents()
+
+            # LSE-merge the four sub-block softmax states; each warp finalizes
+            # m_tile / n_warps rows and writes the normalized partial + LSE.
+            rows_per_warp = self._m_tile // n_warps
+            w_src = cute.make_rmem_tensor((n_warps,), cutlass.Float32)
+            for rr in cutlass.range_constexpr(rows_per_warp):
+                r = warp_id * rows_per_warp + rr
+                if r < G:
+                    m_all = -cutlass.Float32.inf
+                    for s in cutlass.range_constexpr(n_warps):
+                        m_all = cute.arch.fmax(m_all, sMax[s, r])
+                    m_safe = 0.0 if m_all == -cutlass.Float32.inf else m_all
+                    s_all = cutlass.Float32(0.0)
+                    for s in cutlass.range_constexpr(n_warps):
+                        w = cute.math.exp2(
+                            sMax[s, r] * softmax_scale_log2
+                            - m_safe * softmax_scale_log2,
+                            fastmath=True,
+                        )
+                        w_src[s] = w
+                        s_all += w * sSum[s, r]
+                    inv = (
+                        0.0
+                        if (s_all == 0.0 or s_all != s_all)
+                        else cute.arch.rcp_approx(s_all)
+                    )
+                    hq = kv_head * G + r
+                    for j in cutlass.range_constexpr(self._head_dim // 32):
+                        d = lane + j * 32
+                        acc = cutlass.Float32(0.0)
+                        for s in cutlass.range_constexpr(n_warps):
+                            acc += w_src[s] * sAcc[s, r, d]
+                        mOp[chunk_idx, qi, hq, d] = (acc * inv).to(mOp.element_type)
+                    if lane == 0:
+                        mLse[chunk_idx, qi, hq] = (
+                            m_safe * softmax_scale_log2
+                            + cute.math.log2(s_all, fastmath=True)
+                        )
+        else:
+            cute.arch.griddepcontrol_launch_dependents()
+
+    @cute.kernel
     def kernel_fused(
         self,
         mQ: cute.Tensor,
@@ -1306,70 +1701,66 @@ class SparseCombineSm12x:
         if count > self._topk:
             count = cutlass.Int32(self._topk)
 
-        lse_t_slots = self._topk if self._has_lse_t else 1
-
-        @cute.struct
-        class SharedStorage:
-            s_lse: cute.struct.MemRange[cutlass.Float32, self._topk]
-            s_lse_t: cute.struct.MemRange[cutlass.Float32, lse_t_slots]
-
-        smem = cutlass.utils.SmemAllocator()
-        storage = smem.allocate(SharedStorage)
-        s_lse = storage.s_lse.get_tensor(cute.make_layout(self._topk))
-        s_lse_t = storage.s_lse_t.get_tensor(cute.make_layout(lse_t_slots))
-
         neg_inf = -cutlass.Float32.inf
 
+        # Every thread rebuilds the LSE weights redundantly in registers: at low
+        # batch the grid is a sub-wave, the redundant loads hit the same L2
+        # lines, and skipping the smem round trip drops the only CTA barrier.
         # count <= 0 needs no special case: no slot passes s < count, so every
         # weight stays 0.
-        for it in cutlass.range_constexpr(cute.ceil_div(self._topk, self._num_threads)):
-            slot = tidx + it * self._num_threads
-            if slot < self._topk:
-                v = neg_inf
-                if slot < count:
-                    v = mLse2[slot, q, h]
-                s_lse[slot] = v
-                if cutlass.const_expr(self._has_lse_t):
-                    vt = neg_inf
-                    if slot < count:
-                        vt = mLseT2[slot, q, h]
-                    s_lse_t[slot] = vt
-        cute.arch.sync_threads()
-
-        # Every thread rebuilds the LSE weights redundantly: at low batch the grid
-        # is a sub-wave, and building them once on one thread would serialize it.
+        lse_frag = cute.make_rmem_tensor(cute.make_layout(self._topk), cutlass.Float32)
+        for s in cutlass.range_constexpr(self._topk):
+            v = neg_inf
+            if s < count:
+                v = mLse2[s, q, h]
+            lse_frag[s] = v
         m = neg_inf
         for s in cutlass.range_constexpr(self._topk):
-            if s < count:
-                m = cute.arch.fmax(m, s_lse[s])
-        m_finite = m > neg_inf
+            m = cute.arch.fmax(m, lse_frag[s])
+        m_safe = 0.0 if m == neg_inf else m
         w_frag = cute.make_rmem_tensor(cute.make_layout(self._topk), cutlass.Float32)
         denom = cutlass.Float32(0.0)
         for s in cutlass.range_constexpr(self._topk):
-            w = cutlass.Float32(0.0)
-            if s < count and m_finite:
-                w = cute.math.exp2(s_lse[s] - m, fastmath=True)
+            w = cute.math.exp2(lse_frag[s] - m_safe, fastmath=True)
             w_frag[s] = w
             denom += w
+        if m == neg_inf:
+            denom = cutlass.Float32(0.0)
         inv = cutlass.Float32(0.0)
         if denom > 0.0:
             inv = cutlass.Float32(1.0) / denom
 
-        # Branch-free: all topk slots load unconditionally (they pipeline); invalid
-        # slots get weight 0, but 0 * NaN = NaN, so clamp the garbage to finite first
-        # (fmax drops a NaN operand). cutlass-dsl 4.5.2 has no fmin: use -fmax(-x, -c).
-        for i in cutlass.range_constexpr(self._channels_per_thread):
-            c = tidx + i * self._num_threads
-            acc = cutlass.Float32(0.0)
-            for s in cutlass.range_constexpr(self._topk):
-                e = mO_partial[s, q, h, c]
-                if cutlass.const_expr(self._partial_is_fp8):
-                    ef = e.to(cutlass.Float16).to(cutlass.Float32)
-                else:
-                    ef = e.to(cutlass.Float32)
-                ef = cute.arch.fmax(-cute.arch.fmax(-ef, -_FLT_MAX), -_FLT_MAX)
-                acc += w_frag[s] * ef
-            mOut[q, h, c] = (acc * inv * out_scale).to(mOut.element_type)
+        if count == self._topk:
+            # All slots active (the common case): no garbage partials, so the
+            # NaN clamp is unnecessary.
+            for i in cutlass.range_constexpr(self._channels_per_thread):
+                c = tidx + i * self._num_threads
+                acc = cutlass.Float32(0.0)
+                for s in cutlass.range_constexpr(self._topk):
+                    e = mO_partial[s, q, h, c]
+                    if cutlass.const_expr(self._partial_is_fp8):
+                        ef = e.to(cutlass.Float16).to(cutlass.Float32)
+                    else:
+                        ef = e.to(cutlass.Float32)
+                    acc += w_frag[s] * ef
+                mOut[q, h, c] = (acc * inv * out_scale).to(mOut.element_type)
+        else:
+            # Branch-free: all topk slots load unconditionally (they pipeline);
+            # invalid slots get weight 0, but 0 * NaN = NaN, so clamp the garbage
+            # to finite first (fmax drops a NaN operand). cutlass-dsl 4.5.2 has no
+            # fmin: use -fmax(-x, -c).
+            for i in cutlass.range_constexpr(self._channels_per_thread):
+                c = tidx + i * self._num_threads
+                acc = cutlass.Float32(0.0)
+                for s in cutlass.range_constexpr(self._topk):
+                    e = mO_partial[s, q, h, c]
+                    if cutlass.const_expr(self._partial_is_fp8):
+                        ef = e.to(cutlass.Float16).to(cutlass.Float32)
+                    else:
+                        ef = e.to(cutlass.Float32)
+                    ef = cute.arch.fmax(-cute.arch.fmax(-ef, -_FLT_MAX), -_FLT_MAX)
+                    acc += w_frag[s] * ef
+                mOut[q, h, c] = (acc * inv * out_scale).to(mOut.element_type)
 
         if cutlass.const_expr(self._has_lse_out):
             if tidx == 0:
@@ -1382,12 +1773,12 @@ class SparseCombineSm12x:
                 mt = neg_inf
                 for s in cutlass.range_constexpr(self._topk):
                     if s < count:
-                        mt = cute.arch.fmax(mt, s_lse_t[s])
+                        mt = cute.arch.fmax(mt, mLseT2[s, q, h])
                 dt = cutlass.Float32(0.0)
                 if mt > neg_inf:
                     for s in cutlass.range_constexpr(self._topk):
                         if s < count:
-                            dt += cute.math.exp2(s_lse_t[s] - mt, fastmath=True)
+                            dt += cute.math.exp2(mLseT2[s, q, h] - mt, fastmath=True)
                 lse_t = neg_inf
                 if dt > 0.0:
                     lse_t = (mt + cute.math.log2(dt)) * _LN2
