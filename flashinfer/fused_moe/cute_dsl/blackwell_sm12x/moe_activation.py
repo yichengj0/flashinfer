@@ -11,11 +11,6 @@ from cutlass import Float32
 from flashinfer.cute_dsl.fp4_common import fmax_f32, fmin_f32
 
 
-# situ constants are kept for import compatibility with the upstream kernel
-# library; the situ activation itself is not supported in FlashInfer.
-SITU = "situ"
-SITU_DEFAULT_BETA = 4.0
-SITU_DEFAULT_LINEAR_BETA = 25.0
 SWIGLUOAI_UNINTERLEAVE = "swigluoai_uninterleave"
 SWIGLUOAI_DEFAULT_LIMIT = 7.0
 SWIGLUOAI_DEFAULT_ALPHA = 1.702

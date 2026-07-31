@@ -67,12 +67,10 @@ _MICRO_COMPACT_CUTOVER_PAIRS = 20
 _MICRO_COMPACT_CUTOVER_PAIRS_MULTI_TOPK = 40
 # The micro kernel's per-token staging assumes decode-sized batches.
 _MICRO_MAX_TOKENS = 8
-# Direct micro takes the tiny-decode band (m <= 8, routed pairs < 64) ahead of
-# the MMA micro kernel; the band is upstream's and provisional pending
-# cross-GPU measurement.
+# Direct micro takes the tiny-decode band ahead of the MMA micro kernel.
 _DIRECT_MICRO_CUTOVER_PAIRS = 64
 # Test/bench hook: force one backend ("direct_micro", "micro", "static",
-# "dynamic") instead of the token-count heuristic. Not a public API.
+# "dynamic"). Deliberately module-level (a monkeypatch target), not an env var.
 _FORCED_BACKEND: str | None = None
 _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT = 640
 _STATIC_COMPACT_CUTOVER_PAIRS = _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT
@@ -232,11 +230,10 @@ def _select_dynamic_tile_m(
 ) -> int:
     """Pick the dynamic kernel's M-tile from routed rows per expert.
 
-    A small tile_m cuts per-expert M-tile padding for sparse routing; 128
-    amortizes best for dense prefill. Crossovers measured on gated NVFP4 near
-    15, 48, and 96 routed rows per expert. Workspace sizing and the kernel
-    build must derive the tile from this one function with the same inputs,
-    or the task/scale scratch is mis-sized for what the kernel indexes.
+    Small tiles cut per-expert tail padding for sparse routing; 128 amortizes
+    best for dense prefill (crossovers measured on gated NVFP4). Workspace
+    sizing and the kernel build must both derive the tile from this function,
+    or the scratch is mis-sized for what the kernel indexes.
     """
     if not is_gated_activation(activation):
         return _LEVEL_TILE_M
@@ -440,12 +437,13 @@ def allocate_sm120_static_workspace(
     # useful without EP remapping.
     if state_E == weight_E and _direct_micro_candidate(k, n, num_topk, weight_E):
         dm_rows = min(max_rows, _MICRO_MAX_TOKENS * num_topk)
-        # The kernel's epoch-based barriers restore their slots after each
-        # launch, so the zeroed allocation is the only reset ever needed
-        # (replays and CUDA graph capture reuse them as-is).
+        # The epoch-based barriers restore their slots after each launch, so
+        # the zeroed allocation is the only reset needed (graph-replay safe).
         dm_slots = dm_rows + _MICRO_MAX_TOKENS * 16
         fc2_n_chunks = (n // 2 + 127) // 128
-        dm_inter = max(weight_E * n, dm_rows * k + dm_rows * fc2_n_chunks * 128)
+        # The fused kernel binds the intermediate as m * num_topk *
+        # fc2_n_chunks * 128 u32 words; size for the largest supported m.
+        dm_inter = _MICRO_MAX_TOKENS * num_topk * fc2_n_chunks * 128
         workspace.dm_barrier_count = torch.zeros(
             dm_slots, dtype=torch.int32, device=device
         )
@@ -1082,6 +1080,10 @@ def _get_micro_kernel(
     return result
 
 
+# The launch cache skips the per-launch build/configure; the kernel cache
+# dedupes compiles across keys that configure to the same artifact
+# (m=2..8 differ only in grid_x).
+_DIRECT_MICRO_LAUNCH_CACHE: Dict[Tuple, Tuple] = {}
 _DIRECT_MICRO_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
 
 
@@ -1104,14 +1106,34 @@ def _get_direct_micro_kernel(
 ):
     """Compile (or retrieve cached) the SM120 direct micro MoE kernel.
 
-    Returns (compiled, grid_x, accepts_block_dim). grid_x comes from a fresh
-    host-side configure and is not part of the compiled artifact.
+    Returns (compiled, grid_x, accepts_block_dim).
     """
     if activation != SWIGLUOAI_UNINTERLEAVE:
         # The kernel constructor only accepts configurable swiglu parameters
-        # for swigluoai; other activations use its normalized defaults.
+        # for swigluoai; other activations use its normalized defaults
+        # (accept-and-ignore, matching the MMA kernels).
         swiglu_alpha = None
         swiglu_beta = None
+        swiglu_limit = None
+    launch_key = (
+        weight_E,
+        m,
+        k,
+        n,
+        num_topk,
+        topk_ids_dtype,
+        fast_math,
+        share_input_across_experts,
+        share_expert_scales,
+        activation,
+        swiglu_alpha,
+        swiglu_beta,
+        swiglu_limit,
+        str(_canonical_cuda_device(device)) if device is not None else None,
+    )
+    cached = _DIRECT_MICRO_LAUNCH_CACHE.get(launch_key)
+    if cached is not None:
+        return cached
     kernel = build_direct_micro_kernel(
         weight_E,
         m,
@@ -1128,19 +1150,21 @@ def _get_direct_micro_kernel(
         swiglu_beta=swiglu_beta,
         device=device,
     )
-    cache_key = ("direct_micro", kernel.__cache_key__, topk_ids_dtype)
-    cached = _DIRECT_MICRO_KERNEL_CACHE.get(cache_key)
-    if cached is None:
+    compile_key = ("direct_micro", kernel.__cache_key__, topk_ids_dtype)
+    entry = _DIRECT_MICRO_KERNEL_CACHE.get(compile_key)
+    if entry is None:
         compiled = compile_direct_micro_kernel(kernel, topk_ids_dtype=topk_ids_dtype)
         # Register pressure can cap the launchable CTA below the fused body's
         # 512 threads; probe once per compiled kernel.
         accepts = compiled_direct_micro_accepts_block_dim(
             compiled, kernel.launch_block_dim
         )
-        cached = (compiled, accepts)
-        _DIRECT_MICRO_KERNEL_CACHE[cache_key] = cached
-    compiled, accepts = cached
-    return compiled, kernel.grid_x, accepts
+        entry = (compiled, accepts)
+        _DIRECT_MICRO_KERNEL_CACHE[compile_key] = entry
+    compiled, accepts = entry
+    cached = (compiled, kernel.grid_x, accepts)
+    _DIRECT_MICRO_LAUNCH_CACHE[launch_key] = cached
+    return cached
 
 
 # ---------------------------------------------------------------------------
@@ -1242,6 +1266,12 @@ def launch_sm120_static_moe(
                     "forced direct_micro backend cannot run this shape "
                     f"(m={num_tokens}, k={k}, n={n}, top_k={top_k})"
                 )
+            if workspace.dm_barrier_count.numel() < routed_rows + num_tokens * 16:
+                raise ValueError(
+                    "forced direct_micro backend exceeds the workspace barrier "
+                    f"capacity ({workspace.dm_barrier_count.numel()} slots < "
+                    f"{routed_rows} routed rows + {num_tokens * 16})"
+                )
             use_direct_micro = True
         else:
             use_direct_micro = False
@@ -1267,26 +1297,31 @@ def launch_sm120_static_moe(
                 raise RuntimeError("compiled direct micro MoE kernel cannot launch")
             use_direct_micro = False
     if use_direct_micro:
-        # The kernel consumes multiplier-form per-expert scales with no
-        # reciprocal path; invert host-side (zeros stay zero, matching the
-        # MMA kernels' in-kernel guard).
-        staged_gs = input_gs
-        staged_down = down_input_scale
+        # The kernel takes multiplier-form scales only; invert into the
+        # persistent workspace planes (zeros stay zero, matching the MMA
+        # kernels). Non-reciprocal scales pass through directly.
         if input_scales_are_reciprocal:
-            staged_gs = torch.where(input_gs != 0, 1.0 / input_gs, input_gs)
-            staged_down = torch.where(
-                down_input_scale != 0, 1.0 / down_input_scale, down_input_scale
+            workspace.dm_input_gs.copy_(
+                torch.where(input_gs != 0, 1.0 / input_gs, input_gs)
             )
-        workspace.dm_input_gs.copy_(staged_gs)
-        workspace.dm_down_input_scale.copy_(staged_down)
+            workspace.dm_down_input_scale.copy_(
+                torch.where(
+                    down_input_scale != 0, 1.0 / down_input_scale, down_input_scale
+                )
+            )
+            launch_gs = workspace.dm_input_gs
+            launch_down = workspace.dm_down_input_scale
+        else:
+            launch_gs = input_gs
+            launch_down = down_input_scale
         MoEDirectMicroKernel.launch(
             compiled,
             x=a,
             w1_fp4=weights.w1_storage,
             w1_blockscale=weights.w1_scale_storage,
             w1_alphas=weights.w1_alpha,
-            a1_gscale=workspace.dm_input_gs,
-            a2_gscale=workspace.dm_down_input_scale,
+            a1_gscale=launch_gs,
+            a2_gscale=launch_down,
             inter_fp32=workspace.dm_intermediate,
             w2_fp4=weights.w2_storage,
             w2_blockscale=weights.w2_scale_storage,
@@ -1311,7 +1346,22 @@ def launch_sm120_static_moe(
         and routed_rows <= micro_cutover
     )
     if _FORCED_BACKEND is not None:
-        use_micro = _FORCED_BACKEND == "micro"
+        if _FORCED_BACKEND == "micro":
+            # Forced mode raises on correctness violations, never falls back.
+            if num_tokens > _MICRO_MAX_TOKENS:
+                raise ValueError(
+                    f"forced micro backend supports at most {_MICRO_MAX_TOKENS} "
+                    f"tokens (got {num_tokens})"
+                )
+            if flat_ids.numel() > workspace.compact_topk_ids.numel():
+                raise ValueError(
+                    "forced micro backend exceeds the workspace compact-id "
+                    f"capacity ({workspace.compact_topk_ids.numel()} < "
+                    f"{flat_ids.numel()})"
+                )
+            use_micro = True
+        else:
+            use_micro = False
 
     sm_count = get_num_sm(torch.device("cuda"))
     base_mac = min(get_max_active_clusters(1), sm_count)
@@ -2477,8 +2527,7 @@ _Sm120Workspace = Union[
     Sm120W4A16MoEWorkspace,
 ]
 
-# Keyed by (state_E, weight_E, k, n, top_k, device, backend).
-# Stores the workspace with the largest max_rows seen for each key and never
+# Stores the workspace with the largest capacity seen per key and never
 # shrinks within a process. clear_sm120_moe_caches() releases everything.
 _WORKSPACE_CACHE: Dict[Tuple, _Sm120Workspace] = {}
 
@@ -2494,6 +2543,7 @@ def clear_sm120_moe_caches() -> None:
     _PADDED_WEIGHT_CACHE.clear()
     _STATIC_KERNEL_CACHE.clear()
     _MICRO_KERNEL_CACHE.clear()
+    _DIRECT_MICRO_LAUNCH_CACHE.clear()
     _DIRECT_MICRO_KERNEL_CACHE.clear()
     _DYNAMIC_KERNEL_CACHE.clear()
 
@@ -2594,6 +2644,13 @@ def _get_cached_workspace(
     """
     quant_mode = _normalize_quant_mode(quant_mode, activation_precision)
     activation_precision = _activation_precision_from_quant_mode(quant_mode)
+    # Key dynamic workspaces on the tile band of this call's routed_rows; a
+    # larger cached workspace must not pin small calls to its 128 tile.
+    tile_m = (
+        _select_dynamic_tile_m(max(1, routed_rows), state_E, activation)
+        if backend == "dynamic" and quant_mode != "w4a16"
+        else None
+    )
     cache_key = (
         state_E,
         weight_E,
@@ -2604,12 +2661,17 @@ def _get_cached_workspace(
         backend,
         quant_mode,
         activation,
+        tile_m,
     )
     cached = _WORKSPACE_CACHE.get(cache_key)
 
     if cached is not None:
-        if isinstance(cached, (Sm120DynamicMoEWorkspace, Sm120W4A16MoEWorkspace)):
-            if cached.routed_rows_capacity >= max(1, routed_rows):  # type: ignore[union-attr]
+        if isinstance(cached, Sm120DynamicMoEWorkspace):
+            if cached.routed_rows_capacity >= max(1, routed_rows):
+                assert tile_m is None or cached.tile_m == tile_m
+                return cached
+        elif isinstance(cached, Sm120W4A16MoEWorkspace):
+            if cached.routed_rows_capacity >= max(1, routed_rows):
                 return cached
         else:
             if cached.max_rows >= max(1, routed_rows):
@@ -2892,6 +2954,8 @@ def launch_sm120_moe(
                     "num_local_experts == num_experts because dynamic expert "
                     "buffers are indexed by global topk ids."
                 )
+            # A pre-allocated dynamic workspace keeps its stored tile_m even
+            # for smaller calls; its geometry was sized for that tile.
             backend = "dynamic"
         else:
             backend = "static"

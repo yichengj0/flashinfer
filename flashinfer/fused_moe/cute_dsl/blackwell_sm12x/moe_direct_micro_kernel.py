@@ -1,12 +1,12 @@
 """MoEDirectMicroKernel: direct-routed NVFP4 MoE decode kernel for SM12x.
 
-Ported from the b12x kernel library. Unlike MoEMicroKernel (Triton route
-pre-pass, expert-major packed A), this kernel consumes raw per-token
-topk_ids/topk_weights with no routing pre-pass: 16-warp CTAs quantize each
-token row into shared memory, run FC1 as software fp4 dot products over
-f16x2 HFMA, activate, quantize the intermediate, cross a resident-grid
-barrier (or per-token epoch barrier at m==1), and run FC2 with a bf16x2
-atomic scatter into the token-major output.
+Unlike MoEMicroKernel (Triton route pre-pass, expert-major packed A), this
+kernel consumes raw per-token topk_ids/topk_weights with no routing
+pre-pass: 16-warp CTAs quantize each token row into shared memory, run FC1
+as software fp4 dot products over f16x2 HFMA, activate, quantize the
+intermediate, cross a resident-grid barrier (or per-token epoch barrier at
+m==1), and run FC2 with a bf16x2 atomic scatter into the token-major
+output.
 """
 
 from __future__ import annotations
@@ -322,10 +322,8 @@ class MoEDirectMicroKernel:
     """Decode-focused direct-routed MoE kernel for SM12x.
 
     Scale contract: w1_alphas/input_gs/down_input_scale are per-expert
-    [weight_E] f32 tensors with input_gs and down_input_scale in multiplier
-    form (quant q_scale = nvfp4_scale_from_amax(blk_peak, gs); dequant
-    eff_scale = sf_val / gs). Reciprocal-form scales must be inverted
-    host-side before launch.
+    [weight_E] f32 tensors, with input_gs and down_input_scale in multiplier
+    form; reciprocal-form scales must be inverted host-side before launch.
     """
 
     def __init__(
@@ -461,9 +459,9 @@ class MoEDirectMicroKernel:
 
     @cute.jit
     def _packed_scale_col(self, n: Int32) -> Int32:
-        """Column of size_n row n in the shared _pack_e8m0_k32_scales [K/32, N]
-        grid. For N a multiple of 64 the Marlin permute is a per-row column
-        permutation (verified): (n & ~63) | ((n&7)<<3) | swap_bits01((n>>3)&7)."""
+        """Column of output row n in the packed E8M0 [K/32, N] scale grid.
+        For N a multiple of 64 the Marlin permute reduces to a per-row column
+        permutation: (n & ~63) | ((n&7)<<3) | swap_bits01((n>>3)&7)."""
         hi = (n >> Int32(3)) & Int32(7)
         hi_sw = (
             (hi & Int32(4))
@@ -606,9 +604,8 @@ class MoEDirectMicroKernel:
         num_topk: int,
         weight_E: int,
     ) -> bool:
-        # Micro keeps the m tokens' activations resident; 8 is the register
-        # budget ceiling. The FC1 task decode and FC2 are generic in m, so any
-        # 1<=m<=8 is correct (not just powers of two).
+        # The m tokens' activations stay resident; 8 is the register budget
+        # ceiling. FC1/FC2 are generic in m, so any 1 <= m <= 8 is correct.
         if not (1 <= m <= 8):
             return False
         if k <= 0 or k % _BLOCK_SIZE != 0 or k % 128 != 0:
@@ -646,11 +643,9 @@ class MoEDirectMicroKernel:
         )
         num_fc1_chunks = _fc1_chunks_for_m(m, n)
         if self.w4a16_mode and m == 1 and n <= 2048:
-            # The 4-output-rows/warp retile only helps the k_segments==8 aligned
-            # gated path (its activation reg-hoist + dual-dot assume 4 rows).
-            # The packed-scale GLM k_segments==12 path is scale-load limited; one
-            # row/warp keeps those strided packed scale loads out of the inner
-            # row loop without retaining the old native scale grid.
+            # 4 rows/warp only helps the k_segments==8 aligned gated path (its
+            # reg-hoist + dual-dot assume 4 rows). The k_segments==12 path is
+            # scale-load limited; 1 row/warp keeps those loads out of the row loop.
             rows_per_warp_div = 2
             if cfg.k_segments_aligned and cfg.k_segments == 8 and self.is_gated:
                 rows_per_warp_div = 4
@@ -662,12 +657,9 @@ class MoEDirectMicroKernel:
             # the 512-thread launch register limit.
             num_fc1_chunks = max(num_fc1_chunks, n // (_BLOCK_SIZE * 2))
         if self.a8_mx_mode:
-            # Per-32 self-ranging blocks: chunks must hold whole 32-blocks
-            # (the default policy picks i_chunk=16 at m<=2).
-            # The standalone FC1 phase only writes the contiguous FP32
-            # intermediate; it never forms the FC2 per-32 activation scale.
-            # It can therefore use the native 16-row tile, which doubles the
-            # decode work grid without changing quantization semantics.
+            # Per-32 self-ranging blocks: chunks must hold whole 32-blocks.
+            # The standalone FC1 phase never forms the FC2 per-32 activation
+            # scale, so it can keep the native 16-row tile (twice the grid).
             a8_chunk_rows = 16 if self.compile_time_phase == 1 else 32
             a8_chunks = max(1, min(num_fc1_chunks, n // a8_chunk_rows))
             while a8_chunks > 1 and (
@@ -999,11 +991,9 @@ class MoEDirectMicroKernel:
                 kk_off = Int32(kk) * n_u32_per_expert + chunk_base
                 cb_idx = Int32(nc) * Int32(4) + lane_cb
                 w_valid = Int32(1) if cb_idx < num_cb else Int32(0)
-                # If the last 256-wide chunk overhangs a non-256-aligned n
-                # (e.g. n=384), lanes past num_cb index the uninitialized
-                # intermediate tail. The weight there is already masked to 0,
-                # but 0 * NaN = NaN, so mask the activation read too. Gated by
-                # constexpr so 256-aligned shapes emit no extra runtime work.
+                # A last 256-wide chunk overhanging a non-256-aligned n reads
+                # the uninitialized intermediate tail; the weight is masked to
+                # 0 but 0 * NaN = NaN, so mask the activation read too.
                 if cutlass.const_expr((cfg.w2_sf_cols >> 2) < cfg.fc2_n_chunks * 4):
                     xh0 = (
                         Uint32(intermediate[kk_off + Int32(0 * 32) + lane])
@@ -2318,16 +2308,9 @@ class MoEDirectMicroKernel:
                 xh_buf_base + lane_seg_base * Int32(_BLOCK_SIZE // 2) + lane_pad_base
             )
 
-            # The FC1 activation lives in smem with a lane-segmented, padded
-            # layout that depends only on the lane (and input token), not on the
-            # FC1 output row. The k_segments==8 gated path computes
-            # rows_per_warp_fc1 (=4) output rows per warp, and each row's eight
-            # paired fp4_dot8 calls re-read the SAME 64 activation words from
-            # smem. Hoist those reads ONCE per warp-task into registers so the
-            # per-row dots consume them from register, removing 3x of the smem
-            # activation traffic on the issue-bound decode loop. Scoped to the
-            # k_segments==8 aligned gated path (the TP=2 DeepSeek-V4-Flash shape);
-            # every other FC1 variant keeps reading from smem unchanged.
+            # The smem activation layout depends only on the lane and token,
+            # so the k_segments==8 gated path's 4 rows/warp re-read the same
+            # 64 words; hoist them into registers once per warp-task.
             hoist_xh = cutlass.const_expr(
                 cfg.k_segments_aligned and cfg.k_segments == 8 and self.is_gated
             )
@@ -4584,9 +4567,7 @@ class MoEDirectMicroKernel:
                         f0, f1 = quant_dequant_e4m3_2(v0, v1, inv32, scale32)
                         # The combined nvfp4 FC2 alpha is 1/(gs_fc2 * gs_w2);
                         # a8_mx quantizes without the global scale, so fold it
-                        # into the dequantized values here (post-roundtrip:
-                        # exact alpha-equivalent, single site for all FC2
-                        # variants).
+                        # into the dequantized values here (alpha-equivalent).
                         f0 = f0 * gs_fc2
                         f1 = f1 * gs_fc2
                         half_base = chunk_idx * Int32(
@@ -4715,9 +4696,8 @@ class MoEDirectMicroKernel:
         topk_weights: cute.Tensor,
         scatter_output: cute.Tensor,
     ):
-        # FC2 is intentionally factored out so native NVFP4 decode can run it
-        # in a second, non-cooperative launch after FC1 has materialized the
-        # exact same intermediate representation.
+        # FC2 is factored out so it can also run as a second, non-cooperative
+        # launch after a standalone FC1 phase.
         cfg = self._cfg
         w2_base_addr = w2_weights.iterator.toint()
         w2s_base_addr = w2_scales.iterator.toint()
@@ -4937,9 +4917,8 @@ class MoEDirectMicroKernel:
             # One block per SM preserves each variant's register budget.
             min_blocks_per_mp=1,
             # The fused phase crosses a software all-CTA barrier between FC1
-            # and FC2.  Require whole-grid admission so auxiliary-stream work
-            # cannot leave resident CTAs spinning while peers remain queued.
-            # Split FC1/FC2 phases have no grid barrier and stay noncooperative.
+            # and FC2, so require whole-grid admission; resident CTAs must not
+            # spin while peers remain queued. Split phases have no barrier.
             cooperative=self.compile_time_phase == 0,
             stream=stream,
         )
@@ -4994,171 +4973,9 @@ class MoEDirectMicroKernel:
         )
 
 
-class MoEDirectMicroKernelSilu(MoEDirectMicroKernel):
-    def __init__(
-        self,
-        sf_vec_size: int,
-        mma_tiler_mn: Tuple[int, int],
-        output_tile_count_n: int,
-        *,
-        fast_math: bool = False,
-        share_input_across_experts: bool = False,
-        share_expert_scales: bool = False,
-        single_token: bool = False,
-        dynamic_down_scale: bool = False,
-        compile_time_phase: int = 0,
-        a8_mx_mode: bool = False,
-        scale_format: str = "e4m3_k16",
-        e8m0_scale_layout: str = "packed",
-        swiglu_limit: float | None = None,
-        swiglu_alpha: float | None = None,
-        swiglu_beta: float | None = None,
-    ):
-        super().__init__(
-            sf_vec_size,
-            mma_tiler_mn,
-            output_tile_count_n,
-            fast_math=fast_math,
-            activation="silu",
-            share_input_across_experts=share_input_across_experts,
-            share_expert_scales=share_expert_scales,
-            single_token=single_token,
-            dynamic_down_scale=dynamic_down_scale,
-            compile_time_phase=compile_time_phase,
-            a8_mx_mode=a8_mx_mode,
-            scale_format=scale_format,
-            e8m0_scale_layout=e8m0_scale_layout,
-            swiglu_limit=swiglu_limit,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_beta=swiglu_beta,
-        )
-
-
-class MoEDirectMicroKernelGeluTanh(MoEDirectMicroKernel):
-    def __init__(
-        self,
-        sf_vec_size: int,
-        mma_tiler_mn: Tuple[int, int],
-        output_tile_count_n: int,
-        *,
-        fast_math: bool = False,
-        share_input_across_experts: bool = False,
-        share_expert_scales: bool = False,
-        single_token: bool = False,
-        dynamic_down_scale: bool = False,
-        compile_time_phase: int = 0,
-        a8_mx_mode: bool = False,
-        scale_format: str = "e4m3_k16",
-        e8m0_scale_layout: str = "packed",
-        swiglu_limit: float | None = None,
-        swiglu_alpha: float | None = None,
-        swiglu_beta: float | None = None,
-    ):
-        super().__init__(
-            sf_vec_size,
-            mma_tiler_mn,
-            output_tile_count_n,
-            fast_math=fast_math,
-            activation="gelu_tanh",
-            share_input_across_experts=share_input_across_experts,
-            share_expert_scales=share_expert_scales,
-            single_token=single_token,
-            dynamic_down_scale=dynamic_down_scale,
-            compile_time_phase=compile_time_phase,
-            a8_mx_mode=a8_mx_mode,
-            scale_format=scale_format,
-            e8m0_scale_layout=e8m0_scale_layout,
-            swiglu_limit=swiglu_limit,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_beta=swiglu_beta,
-        )
-
-
-class MoEDirectMicroKernelRelu2(MoEDirectMicroKernel):
-    def __init__(
-        self,
-        sf_vec_size: int,
-        mma_tiler_mn: Tuple[int, int],
-        output_tile_count_n: int,
-        *,
-        fast_math: bool = False,
-        share_input_across_experts: bool = False,
-        share_expert_scales: bool = False,
-        single_token: bool = False,
-        dynamic_down_scale: bool = False,
-        a8_mx_mode: bool = False,
-        scale_format: str = "e4m3_k16",
-        e8m0_scale_layout: str = "packed",
-    ):
-        super().__init__(
-            sf_vec_size,
-            mma_tiler_mn,
-            output_tile_count_n,
-            fast_math=fast_math,
-            activation="relu2",
-            share_input_across_experts=share_input_across_experts,
-            share_expert_scales=share_expert_scales,
-            single_token=single_token,
-            dynamic_down_scale=dynamic_down_scale,
-            a8_mx_mode=a8_mx_mode,
-            scale_format=scale_format,
-            e8m0_scale_layout=e8m0_scale_layout,
-        )
-
-
-class MoEDirectMicroKernelSwiGLUOAI(MoEDirectMicroKernel):
-    def __init__(
-        self,
-        sf_vec_size: int,
-        mma_tiler_mn: Tuple[int, int],
-        output_tile_count_n: int,
-        *,
-        fast_math: bool = False,
-        share_input_across_experts: bool = False,
-        share_expert_scales: bool = False,
-        single_token: bool = False,
-        dynamic_down_scale: bool = False,
-        a8_mx_mode: bool = False,
-        scale_format: str = "e4m3_k16",
-        e8m0_scale_layout: str = "packed",
-        swiglu_limit: float | None = None,
-        swiglu_alpha: float | None = None,
-        swiglu_beta: float | None = None,
-    ):
-        activation = SWIGLUOAI_UNINTERLEAVE
-        super().__init__(
-            sf_vec_size,
-            mma_tiler_mn,
-            output_tile_count_n,
-            fast_math=fast_math,
-            activation=activation,
-            share_input_across_experts=share_input_across_experts,
-            share_expert_scales=share_expert_scales,
-            single_token=single_token,
-            dynamic_down_scale=dynamic_down_scale,
-            a8_mx_mode=a8_mx_mode,
-            scale_format=scale_format,
-            e8m0_scale_layout=e8m0_scale_layout,
-            swiglu_limit=normalize_swiglu_limit_for_activation(
-                activation, swiglu_limit
-            ),
-            swiglu_alpha=normalize_swiglu_alpha_for_activation(
-                activation, swiglu_alpha
-            ),
-            swiglu_beta=normalize_swiglu_beta_for_activation(activation, swiglu_beta),
-        )
-
-
 # ---------------------------------------------------------------------------
 # Host-side helpers for the dispatch layer
 # ---------------------------------------------------------------------------
-
-DIRECT_MICRO_ACTIVATION_KERNEL_CLS = {
-    "silu": MoEDirectMicroKernelSilu,
-    "gelu_tanh": MoEDirectMicroKernelGeluTanh,
-    "relu2": MoEDirectMicroKernelRelu2,
-    SWIGLUOAI_UNINTERLEAVE: MoEDirectMicroKernelSwiGLUOAI,
-}
 
 
 def build_direct_micro_kernel(
@@ -5266,12 +5083,15 @@ def compile_direct_micro_kernel(
     )
 
 
+_PROBE_FAILURE_WARNED = False
+
+
 def compiled_direct_micro_accepts_block_dim(compiled, block_dim: int) -> bool:
     """Return whether the compiled direct micro kernel can launch ``block_dim``
     threads (register pressure can cap CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK
     below the 512-thread CTA the fused body wants). Callers should cache the
     result per compiled kernel."""
-    accepted = False
+    global _PROBE_FAILURE_WARNED
     try:
         from cuda.bindings import driver, runtime
 
@@ -5305,20 +5125,31 @@ def compiled_direct_micro_accepts_block_dim(compiled, block_dim: int) -> bool:
         )
         if err != driver.CUresult.CUDA_SUCCESS:
             raise RuntimeError(f"cuKernelGetAttribute failed with {err}")
-        accepted = int(max_threads) >= int(block_dim)
-    except Exception:
-        accepted = False
+        return int(max_threads) >= int(block_dim)
+    except (AttributeError, KeyError, TypeError):
+        # Expected introspection misses on this DSL version; fall back to the
+        # MMA micro kernel silently.
+        return False
+    except Exception as exc:
+        # Anything else means the probe itself broke (e.g. a DSL internals
+        # change). Warn once so the direct micro backend is not silently
+        # disabled, but keep the safe fallback.
+        if not _PROBE_FAILURE_WARNED:
+            _PROBE_FAILURE_WARNED = True
+            import warnings
 
-    return accepted
+            warnings.warn(
+                "compiled_direct_micro_accepts_block_dim probe failed "
+                f"({type(exc).__name__}: {exc}); disabling the direct micro "
+                "MoE backend for this process.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        return False
 
 
 __all__ = [
-    "DIRECT_MICRO_ACTIVATION_KERNEL_CLS",
     "MoEDirectMicroKernel",
-    "MoEDirectMicroKernelGeluTanh",
-    "MoEDirectMicroKernelRelu2",
-    "MoEDirectMicroKernelSilu",
-    "MoEDirectMicroKernelSwiGLUOAI",
     "build_direct_micro_kernel",
     "compile_direct_micro_kernel",
     "compiled_direct_micro_accepts_block_dim",

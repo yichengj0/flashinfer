@@ -1159,15 +1159,12 @@ def pow2_ceil_ue8m0(
     loc=None,
     ip=None,
 ) -> Tuple[Float32, Uint32]:
-    """Round a positive FP32 ``scale`` UP to a power of two, bit-exactly.
+    """Round a positive FP32 ``scale`` up to a power of two, bit-exactly.
 
-    Returns ``(rounded_fp32, ue8m0_byte)`` where:
-      * ``rounded_fp32`` == ``__uint_as_float(power_of_2_round(__float_as_uint(scale)))``
-      * ``ue8m0_byte``   == ``(__float_as_uint(rounded_fp32) >> 23) & 0xFF``
-
-    Bit-exact replica of FlashInfer's fp8_quant.cuh rounding +
-    scale_convert.cuh fp32_to_ue8m0. Integer ops only (no lg2.approx), so unlike
-    ``cvt_f32_to_ue8m0`` it matches the FlashInfer reference bit-for-bit.
+    Returns ``(rounded_fp32, ue8m0_byte)`` with ``ue8m0_byte`` the biased
+    exponent of the rounded value. Integer ops only (no lg2.approx), so
+    unlike ``cvt_f32_to_ue8m0`` it matches the fp8_quant.cuh rounding and
+    scale_convert.cuh fp32_to_ue8m0 references bit-for-bit.
     """
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.f32(), T.i32()]),
@@ -2388,9 +2385,8 @@ def quant_dequant_e4m3_2(
 ) -> Tuple[Float32, Float32]:
     """Quantize-dequantize a pair through E4M3 with a power-of-two block scale.
 
-    RN-saturating E4M3 of ``v*inv_scale``, decoded back and rescaled. Used by
-    the micro decode kernel's a8_mx mode so decode numerics track the w4a8
-    prefill activation quantizer.
+    Keeps a8_mx decode numerics matched to the w4a8 prefill activation
+    quantizer.
     """
     q0 = fp8_e4m3_to_f32(cvt_f32_to_e4m3(v0 * inv_scale)) * scale
     q1 = fp8_e4m3_to_f32(cvt_f32_to_e4m3(v1 * inv_scale)) * scale

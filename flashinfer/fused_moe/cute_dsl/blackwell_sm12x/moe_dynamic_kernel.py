@@ -289,10 +289,9 @@ class MoEDynamicKernel:
         self.share_input_across_experts = share_input_across_experts
         tile_k = sf_vec_size * 8
         self.tile_shape_mnk = (mma_tiler_mn[0], mma_tiler_mn[1], tile_k)
-        # Scale-factor tiles are 128-row atoms in hardware. For sub-128 MMA
-        # tiles one atom backs several MMA tiles, so the TMA atoms and smem
-        # are built at max(128, tile) and the kernel offsets into the shared
-        # block by `*_tiles_per_block`.
+        # Scale factors come in 128-row atoms, so for sub-128 MMA tiles the
+        # TMA atoms and smem are built at max(128, tile) and the kernel
+        # offsets into the shared block by `*_tiles_per_block`.
         self.sa_tile_shape_mk = (max(128, mma_tiler_mn[0]), tile_k)
         self.sa_tiles_per_block = self.sa_tile_shape_mk[0] // mma_tiler_mn[0]
         self.sfa_tile_shape_mk = (max(128, mma_tiler_mn[0]), tile_k)
@@ -379,10 +378,9 @@ class MoEDynamicKernel:
         self.num_n_tiles = self.tile_shape_mnk[1] // (8 * self.atom_shape[1])
         self.num_k_blocks = self.tile_shape_mnk[2] // 64
 
-        # A and SFA smem hold the 128-row block for sub-128 MMA tiles (the SF
-        # helper also asserts tile M % 64 == 0), so build all smem layouts at
-        # the 128-row block shape. Identity at tile_m == 128; sub-128 tasks
-        # slice into the shared block (see sa_tiles_per_block).
+        # A/SFA smem hold the whole 128-row block for sub-128 MMA tiles (the
+        # SF smem helper also rejects tile M % 64 != 0), so build all smem
+        # layouts at the block shape; sub-128 tasks slice into it.
         smem_tile_shape_mnk = (
             self.sa_tile_shape_mk[0],
             self.tile_shape_mnk[1],
@@ -418,8 +416,7 @@ class MoEDynamicKernel:
         # per-stage footprint so shapes with room keep their extra stages.
         nb = 2 if self.is_gated else 1
         n_pipe = 3 if self.is_gated else 2
-        # sA smem is the 128-row block for sub-128 tiles, so size the stage
-        # from sa_tile_shape_mk (= tile_m at tile_m >= 128).
+        # sA smem holds the whole 128-row block, so size the stage from it.
         a_bytes = (
             self.sa_tile_shape_mk[0]
             * self.sa_tile_shape_mk[1]
@@ -1260,9 +1257,8 @@ class MoEDynamicKernel:
                                         ),
                                         packed64,
                                     )
-                                    # Scale storage uses 128-row SF atoms:
-                                    # index by the atom plus row-within-atom,
-                                    # not the MMA tile. Identity at tile 128.
+                                    # Scale storage is tiled in 128-row SF
+                                    # atoms, not MMA tiles.
                                     k_tile_idx = sf_idx // Int32(4)
                                     sf_atom = phys_row >> Int32(7)
                                     sf_row = phys_row & Int32(127)
@@ -1359,9 +1355,8 @@ class MoEDynamicKernel:
                                     packed64,
                                 )
 
-                                # Scale storage uses 128-row SF atoms: index by
-                                # the atom plus row-within-atom, not the MMA
-                                # tile. Identity at tile 128.
+                                # Scale storage is tiled in 128-row SF atoms,
+                                # not MMA tiles.
                                 k_tile_idx = sf_idx // Int32(4)
                                 inner_k_idx = sf_idx % Int32(4)
                                 phys_row = phys_tile * Int32(
@@ -1536,9 +1531,8 @@ class MoEDynamicKernel:
         tBgSFB_down = cute.filter_zeros(tBgSFB_down)
 
         # MMA fragment partitions
-        # sA/sSFA hold the 128-row block for sub-128 MMA tiles; slice to the
-        # tile_m sub-tile the V-map expects (the per-task offset is applied at
-        # consumption). Identity at tile_m == 128.
+        # sA/sSFA hold the whole 128-row block; slice to the tile_m sub-tile
+        # the V-map expects (the per-task offset is applied at consumption).
         if cutlass.const_expr(self.sa_tiles_per_block > 1):
             sA_part = cute.local_tile(
                 sA,
@@ -1742,10 +1736,9 @@ class MoEDynamicKernel:
                 alpha_value = alpha[task_expert_idx].to(cutlass.Float32)
                 valid_rows = task_valid_rows_val
 
-                # FC1 reads the TMA-loaded activation A/SF, whose rows sit at
-                # offset (task_m_tile_idx % sfa_tiles_per_block) within the
-                # shared 128-row block. FC2 re-slices at offset 0 before phase
-                # B, since its intermediate is quant-written to the block head.
+                # FC1's activation rows sit at offset (task_m_tile_idx %
+                # sfa_tiles_per_block) within the shared 128-row block; FC2
+                # re-slices at offset 0 since its intermediate is written there.
                 if cutlass.const_expr(self.sfa_tiles_per_block > 1):
                     _fc1_off = task_m_tile_idx % Int32(self.sfa_tiles_per_block)
                     _sA_il = cute.local_tile(
@@ -2236,9 +2229,9 @@ class MoEDynamicKernel:
                     warp_m_base = (warp_in_tile >> Int32(1)) * Int32(64)
                     warp_n_base = (warp_in_tile & Int32(1)) * Int32(64)
 
-                    # FC2's intermediate A/SF were quant-written to the head of
-                    # the shared 128-row block, so phase B re-slices at offset
-                    # 0 (vs FC1's per-task offset). Identity at tile_m == 128.
+                    # FC2's intermediate was quant-written to the head of the
+                    # shared 128-row block, so phase B re-slices at offset 0
+                    # rather than FC1's per-task offset.
                     if cutlass.const_expr(self.sfa_tiles_per_block > 1):
                         _sA_p2 = cute.local_tile(
                             sA,
@@ -2503,10 +2496,9 @@ class MoEDynamicKernel:
                 task_slice_begin_idx = work_item[_WORK_SLICE_BEGIN]
                 task_slice_count_val = work_item[_WORK_SLICE_COUNT]
 
-                # gA/gSFA are tiled in 128-row blocks; a sub-128 MMA tile maps
-                # to block task_m_tile_idx // tiles_per_block and the fragment
-                # partition selects the within-block sub-tile. Identity at
-                # tile_m == 128 (tiles_per_block == 1).
+                # gA/gSFA are tiled in 128-row blocks: a sub-128 MMA tile maps
+                # to block task_m_tile_idx // tiles_per_block, and the
+                # fragment partition selects the within-block sub-tile.
                 sa_block_idx = task_m_tile_idx // Int32(self.sa_tiles_per_block)
                 tAgA_mk = tAgA[(None, sa_block_idx, None, Int32(0))]
                 sfa_block_idx = task_m_tile_idx // Int32(self.sfa_tiles_per_block)
