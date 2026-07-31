@@ -204,20 +204,38 @@ def _is_w4a16(activation_precision: str) -> bool:
     return _normalize_activation_precision(activation_precision) == "bf16"
 
 
-def _level_tile_m(activation_precision: str = "fp4") -> int:
-    if _is_w4a16(activation_precision):
-        raise ValueError(
-            "internal routing error: quant_mode='w4a16' reached the NVFP4 tile selector"
-        )
-    return _LEVEL_TILE_M
-
-
 def _level_tile_n(activation_precision: str = "fp4") -> int:
     if _is_w4a16(activation_precision):
         raise ValueError(
             "internal routing error: quant_mode='w4a16' reached the NVFP4 tile selector"
         )
     return _LEVEL_TILE_N
+
+
+def _select_dynamic_tile_m(
+    routed_rows: int,
+    num_experts: int,
+    activation: str = "silu",
+) -> int:
+    """Pick the dynamic kernel's M-tile from routed rows per expert.
+
+    A small tile_m cuts per-expert M-tile padding for sparse routing; 128
+    amortizes best for dense prefill. Crossovers measured on gated NVFP4 near
+    15, 48, and 96 routed rows per expert. Workspace sizing and the kernel
+    build must derive the tile from this one function with the same inputs,
+    or the task/scale scratch is mis-sized for what the kernel indexes.
+    """
+    if not is_gated_activation(activation):
+        return _LEVEL_TILE_M
+    routed_rows = max(1, int(routed_rows))
+    num_experts = max(1, int(num_experts))
+    if routed_rows < 15 * num_experts:
+        return 16
+    if routed_rows < 48 * num_experts:
+        return 32
+    if routed_rows < 96 * num_experts:
+        return 64
+    return _LEVEL_TILE_M
 
 
 def _get_static_compact_cutover_pairs(activation_precision: str = "fp4") -> int:
@@ -1268,6 +1286,9 @@ class Sm120DynamicMoEWorkspace:
     routed_rows_capacity: int
     physical_tiles_capacity: int
     task_capacity: int
+    # The M-tile the geometry above was sized for; launches must build the
+    # kernel with the same tile.
+    tile_m: int = _LEVEL_TILE_M
     expert_write_rows: torch.Tensor
     expert_tile_base: torch.Tensor
     pair_head: torch.Tensor
@@ -1319,6 +1340,7 @@ def allocate_sm120_dynamic_workspace(
     num_topk: int,
     device: torch.device,
     activation_precision: str = "fp4",
+    activation: str = "silu",
 ) -> Sm120DynamicMoEWorkspace:
     """Allocate workspace buffers for the SM120 dynamic MoE kernel."""
     activation_precision = _normalize_activation_precision(activation_precision)
@@ -1327,7 +1349,7 @@ def allocate_sm120_dynamic_workspace(
             "allocate_sm120_dynamic_workspace only supports quant_mode='nvfp4'; "
             "use allocate_sm120_moe_workspace(..., quant_mode='w4a16') for W4A16."
         )
-    tile_m = _level_tile_m(activation_precision)
+    tile_m = _select_dynamic_tile_m(routed_rows, state_E, activation)
     physical_tiles, _, max_tasks = _dynamic_task_geometry(
         state_E,
         n,
@@ -1336,9 +1358,12 @@ def allocate_sm120_dynamic_workspace(
         tile_n=_level_tile_n(activation_precision),
     )
     rows_padded = physical_tiles * tile_m
+    # The kernel addresses activation scales in 128-row SF atoms regardless of
+    # tile_m, so the scale plane must cover the last partial atom.
+    scale_rows = _align_up(rows_padded, 128)
     cols_pad_k = _align_up(k // _NVFP4_BLOCK_SIZE, 4)
     _check_memref_limit("dynamic packed_input", rows_padded * (k // 2))
-    _check_memref_limit("dynamic packed_input_scale", rows_padded * cols_pad_k)
+    _check_memref_limit("dynamic packed_input_scale", scale_rows * cols_pad_k)
     packed_input = torch.empty(1, rows_padded, k // 2, dtype=torch.uint8, device=device)
 
     workspace = Sm120DynamicMoEWorkspace(
@@ -1353,12 +1378,13 @@ def allocate_sm120_dynamic_workspace(
         routed_rows_capacity=routed_rows,
         physical_tiles_capacity=physical_tiles,
         task_capacity=max_tasks,
+        tile_m=tile_m,
         row_counts=torch.zeros(state_E, dtype=torch.int32, device=device),
         token_map=torch.zeros(rows_padded, dtype=torch.int32, device=device),
         token_weights=torch.zeros(rows_padded, dtype=torch.float32, device=device),
         packed_input=packed_input,
         packed_input_scale=torch.empty(
-            rows_padded, cols_pad_k, dtype=torch.uint8, device=device
+            scale_rows, cols_pad_k, dtype=torch.uint8, device=device
         ),
         barrier_count=torch.zeros(1, dtype=torch.int32, device=device),
         barrier_epoch=torch.zeros(1, dtype=torch.int32, device=device),
@@ -1472,9 +1498,12 @@ class _DynamicMoELaunch:
                 (rows_padded * self._packed_storage_cols,), stride=(1,)
             ),
         )
+        # Activation scales live in 128-row SF atoms; the plane is allocated
+        # through the last partial atom even when rows_padded is not aligned.
+        scale_rows = ((rows_padded + 127) // 128) * 128
         scale_storage = cute.make_tensor(
             scale_storage_ptr,
-            layout=cute.make_layout((rows_padded * self._cols_pad_k,), stride=(1,)),
+            layout=cute.make_layout((scale_rows * self._cols_pad_k,), stride=(1,)),
         )
         token_map = cute.make_tensor(
             token_map_ptr, layout=cute.make_layout((rows_padded,), stride=(1,))
@@ -1542,6 +1571,7 @@ def _get_dynamic_kernel(
     swiglu_limit: float | None = None,
     activation_precision: str = "fp4",
     share_input_across_experts: bool = False,
+    tile_m: int = _LEVEL_TILE_M,
 ):
     """Compile (or retrieve cached) the SM120 dynamic MoE kernel."""
     activation_precision = _normalize_activation_precision(activation_precision)
@@ -1557,10 +1587,9 @@ def _get_dynamic_kernel(
     base_mac = min(get_max_active_clusters(1), sm_count)
     tuned_mac = _lookup_mac_ladder(_DYNAMIC_MAC_LADDER, m * num_topk)
     mac = min(tuned_mac or base_mac, base_mac)
-    mma_tiler_mn = (
-        _level_tile_m(activation_precision),
-        _level_tile_n(activation_precision),
-    )
+    # tile_m comes from the workspace's shared selection so the kernel's task
+    # and scale indexing matches the allocated scratch geometry.
+    mma_tiler_mn = (tile_m, _level_tile_n(activation_precision))
 
     cache_key = (
         "dynamic",
@@ -1803,6 +1832,7 @@ def launch_sm120_dynamic_moe(
         swiglu_limit=swiglu_limit,
         activation_precision=activation_precision,
         share_input_across_experts=input_gs_is_shared,
+        tile_m=workspace.tile_m,
     )
 
     # Dynamic kernel: runtime-shaped args are DataPointer (pass data_ptr()),
@@ -1838,7 +1868,7 @@ def launch_sm120_dynamic_moe(
         workspace.token_weights.data_ptr(),
         num_tokens,
         workspace.max_rows,
-        workspace.physical_tiles_capacity * _level_tile_m(activation_precision),
+        workspace.physical_tiles_capacity * workspace.tile_m,
         workspace.task_capacity,
     )
     compiled(*runtime_args, current_cuda_stream())
@@ -2320,6 +2350,7 @@ def allocate_sm120_moe_workspace(
             num_topk=num_topk,
             device=device,
             activation_precision=activation_precision,
+            activation=activation,
         )
     if backend == "static":
         return allocate_sm120_static_workspace(
